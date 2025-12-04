@@ -86,7 +86,50 @@ def split_components(gdf,cycleway_nodes):
     gdf['both_connected'] = gdf['start_connected'] & gdf['end_connected']
 
     return gdf
+    
+def group_street_components(gdf, name_col="street_name"):
+    # Result container
+    all_results = []
 
+    # Process each street name separately
+    for name, group in gdf.groupby(name_col):
+        group = group.copy()
+        group = group.reset_index(drop=False)  # keep original index
+
+        # Build graph
+        G = nx.Graph()
+        G.add_nodes_from(group.index)
+
+        # Spatial index speeds up the touching lookup
+        sindex = group.sindex
+
+        for i, geom in group.geometry.items():
+            # Candidate neighbors using bounding box intersection
+            possible = list(sindex.intersection(geom.bounds))
+            possible.remove(i)  # remove itself
+
+            for j in possible:
+                if geom.touches(group.geometry[j]) or geom.intersects(group.geometry[j]):
+                    G.add_edge(i, j)
+
+        # Extract connected components
+        components = list(nx.connected_components(G))
+
+        # Assign component labels
+        comp_map = {}
+        for comp_id, comp_nodes in enumerate(components):
+            for n in comp_nodes:
+                comp_map[n] = comp_id
+
+        group["component_id"] = group.index.map(comp_map)
+        group["project"] = (
+            group[name_col].astype(str) + "_" + group["component_id"].astype(str)
+        )
+
+        all_results.append(group)
+
+    return gpd.GeoDataFrame(pd.concat(all_results).set_index(['u','v','key']))
+    
 class Network:
     def __init__(self, crs = 32618):
         self.crs = crs
@@ -117,6 +160,8 @@ class Network:
         self.turn_penalties = None
         self.iterations_description = pd.DataFrame(columns=['generalized_benefit','added_length','n_near_completed_routes','n_recomputed_routes','n_changed_routes'])
         self.cycleway_nodes = None
+        self.projects = None
+        
         
     def load_n_pot(self,path):
         self.n_pot = ox.io.load_graphml(path)
@@ -229,18 +274,22 @@ class Network:
     
     
     def compute_routes_summary(self, beta_age,mu_age,scale_age,beta_transit,beta_bikeway,alpha,weight = None, proximity_dist = 10, subsample_idxs = None):
-        
+    
         if subsample_idxs is None:
             subsample = self.all_routes_edges
             subsample_idxs = self.sample.index
             self.routes_summary = subsample[['length','gencost','route_number']].groupby(['route_number']).sum()
             self.routes_summary = pd.merge(self.routes_summary,self.sample,left_index=True,right_index=True,how='left')
+            if self.projects is not None:
+                self.projects_summary = self.projects[['length','project']].groupby('project').sum()
         else:
             subsample = self.all_routes_edges[self.all_routes_edges.route_number.isin(subsample_idxs)]
-            
+    
         subsample['flow'] = subsample.join(subsample.index.value_counts(), how = 'left')['count']
         grouped_route_links = subsample.groupby('route_number')
-         
+    
+        
+        
         self.routes_summary.loc[subsample_idxs,'length_cycleway'] = grouped_route_links.apply(
             lambda x: x.loc[x["highway"] == "cycleway", "length"].sum(),include_groups=False)
         self.routes_summary.loc[subsample_idxs,'length_street'] =grouped_route_links.apply(
@@ -251,15 +300,35 @@ class Network:
         self.routes_summary.loc[subsample_idxs,'prop_cycleway'] = (self.routes_summary.loc[subsample_idxs,'length_cycleway']/
                                                                     (self.routes_summary.loc[subsample_idxs,'length_street']+
                                                                     self.routes_summary.loc[subsample_idxs,'length_cycleway']))
-        
-        masks = self.routes_summary.loc[subsample_idxs,'links_id_to_complete'].apply(
-        lambda x: get_mask(x, self.routes_summary.loc[subsample_idxs,'links_id_to_complete'], alpha)
-        )
     
-        self.routes_summary.loc[subsample_idxs, 'n_near_completed_routes'] = masks.apply(sum)
-        self.routes_summary.loc[subsample_idxs, 'near_completed_routes'] = masks.apply(
-        lambda m: self.routes_summary.loc[subsample_idxs].loc[m].index
-        )
+        
+    
+        if self.projects is not None:
+            grouped_projects = self.projects.groupby('project')
+            self.projects_summary.loc[:,'length_street'] = grouped_projects.apply(
+                lambda x: x.loc[x["highway"] != "cycleway", "length"].sum(),include_groups=False)
+            
+            self.projects_summary.loc[:,'links_id_to_complete'] = grouped_projects.apply(
+                lambda x: set(x.loc[x["highway"] != "cycleway"].index.tolist()), include_groups = False)
+        
+            masks = self.projects_summary.loc[:,'links_id_to_complete'].apply(
+            lambda x: get_mask(x, self.routes_summary.loc[subsample_idxs,'links_id_to_complete'], alpha)
+            )
+        
+            self.projects_summary.loc[:, 'n_near_completed_routes'] = masks.apply(sum)
+            self.projects_summary.loc[:, 'near_completed_routes'] = masks.apply(
+            lambda m: self.routes_summary.loc[subsample_idxs].loc[m].index
+            )
+            
+        else:
+            masks = self.routes_summary.loc[subsample_idxs,'links_id_to_complete'].apply(
+            lambda x: get_mask(x, self.routes_summary.loc[subsample_idxs,'links_id_to_complete'], alpha)
+            )
+        
+            self.routes_summary.loc[subsample_idxs, 'n_near_completed_routes'] = masks.apply(sum)
+            self.routes_summary.loc[subsample_idxs, 'near_completed_routes'] = masks.apply(
+            lambda m: self.routes_summary.loc[subsample_idxs].loc[m].index
+            )
         
         
         self.routes_summary.loc[subsample_idxs,'fpkm'] = grouped_route_links.apply(
@@ -274,24 +343,49 @@ class Network:
             self.routes_summary.loc[subsample_idxs,'sl_dist'] = self.n_pot_nodes.loc[o_nodes_idxs].distance(self.n_pot_nodes.loc[d_nodes_idxs],align = False).values
         self.routes_summary.loc[subsample_idxs,'tort'] = self.routes_summary.loc[subsample_idxs,
         'total_length']/self.routes_summary.loc[subsample_idxs,'sl_dist']
-        
-        transit_min = grouped_route_links['transit_min_dist'].min()
-        self.routes_summary['transit_min_dist'] = self.routes_summary.index.map(transit_min)
     
-        self.cycleway_nodes = set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('u')).union(
-            set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('v')))
-        route_nodes = self.routes.loc[subsample_idxs, 'nodes']
-        self.routes_summary.loc[subsample_idxs, 'connects_existing_network'] = (
-            route_nodes.apply(lambda nodes: bool(set(nodes) & self.cycleway_nodes))
-        )
+        if self.projects is not None:
+            
+            transit_min = grouped_projects['transit_min_dist'].min()
+            self.projects_summary['transit_min_dist'] = self.projects_summary.index.map(transit_min)
         
-        self.routes_summary.loc[subsample_idxs,'generalized_benefit']=self.routes_summary.loc[subsample_idxs]['n_near_completed_routes']/self.routes_summary.loc[subsample_idxs,'length_street']
+            self.cycleway_nodes = set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('u')).union(
+                set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('v')))
         
-        if weight is not None:
-            self.routes_summary.loc[subsample_idxs,'generalized_benefit']*= self.routes_summary.loc[subsample_idxs,weight] 
+            
+            projects_nodes = self.projects.groupby('project').apply(lambda p: set(p.index.get_level_values('u'))|set(p.index.get_level_values('v')),include_groups=False)
+            
+            self.projects_summary.loc[:, 'connects_existing_network'] = (
+                projects_nodes.apply(lambda nodes: bool(set(nodes) & self.cycleway_nodes))
+            )
+            
+            self.projects_summary.loc[:,'generalized_benefit']=self.projects_summary.loc[:,'n_near_completed_routes']/self.projects_summary.loc[:,'length_street']
+            
+            if weight is not None:
+                self.projects_summary.loc[:,'generalized_benefit']*= self.projects_summary['near_completed_routes'].apply(lambda x: self.sample.loc[x,weight].sum())
+            
+            self.projects_summary.loc[:,'generalized_benefit']+=((self.projects_summary.loc[:]['transit_min_dist']<proximity_dist)*beta_transit*np.std(self.projects_summary.loc[:,'generalized_benefit'])
+                                                                            +self.projects_summary.loc[:]['connects_existing_network']*beta_bikeway*np.std(self.projects_summary.loc[:,'generalized_benefit']))
+        else:
+    
+            transit_min = grouped_route_links['transit_min_dist'].min()
+            self.routes_summary['transit_min_dist'] = self.routes_summary.index.map(transit_min)
         
-        self.routes_summary.loc[subsample_idxs,'generalized_benefit']+=((self.routes_summary.loc[subsample_idxs]['transit_min_dist']<proximity_dist)*beta_transit*np.std(self.routes_summary.loc[subsample_idxs,'generalized_benefit'])
-                                                                        +self.routes_summary.loc[subsample_idxs]['connects_existing_network']*beta_bikeway*np.std(self.routes_summary.loc[subsample_idxs,'generalized_benefit']))
+            self.cycleway_nodes = set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('u')).union(
+                set(self.n_pot_edges[self.n_pot_edges.highway == 'cycleway'].index.get_level_values('v')))
+            route_nodes = self.routes.loc[subsample_idxs, 'nodes']
+            self.routes_summary.loc[subsample_idxs, 'connects_existing_network'] = (
+                route_nodes.apply(lambda nodes: bool(set(nodes) & self.cycleway_nodes))
+            )
+            
+            self.routes_summary.loc[subsample_idxs,'generalized_benefit']=self.routes_summary.loc[subsample_idxs]['n_near_completed_routes']/self.routes_summary.loc[subsample_idxs,'length_street']
+            
+            if weight is not None:
+                self.routes_summary.loc[subsample_idxs,'generalized_benefit']*= self.routes_summary.loc[subsample_idxs,weight] 
+            
+            self.routes_summary.loc[subsample_idxs,'generalized_benefit']+=((self.routes_summary.loc[subsample_idxs]['transit_min_dist']<proximity_dist)*beta_transit*np.std(self.routes_summary.loc[subsample_idxs,'generalized_benefit'])
+                                                                            +self.routes_summary.loc[subsample_idxs]['connects_existing_network']*beta_bikeway*np.std(self.routes_summary.loc[subsample_idxs,'generalized_benefit']))
+
     
 
     def plot_routes(self,network):
@@ -394,7 +488,7 @@ class Network:
         self.iterations_description = self.iterations_description.iloc[0:0]
         
     def run_algo2(self, budget, savepath,beta_age, mu_age,scale_age,beta_transit,beta_bikeway,alpha,ltp,rtp,icp,tsp,build_dmin,weight = None,
-              plot = False, buffer = 350, cost_reduction_factor=0.9, proximity_dist = 10, backup_every = 100,metric = 'completion',turn_penalties = False):
+              plot = False, buffer = 350, cost_reduction_factor=0.9, proximity_dist = 10, backup_every = 100,metric = 'completion',turn_penalties = False,recompute_routes = True):
         added_routes = []
         i=0
         
@@ -486,46 +580,71 @@ class Network:
                     print('Adding route ', route_id_to_add, f'(normalized fpkm = {self.routes_summary.loc[route_id_to_add,"normalized_fpkm"]},length = {self.routes_summary.loc[route_id_to_add,"length_street"]})')
         
                 elif metric == 'completion':
-                    route_id_to_add = self.routes_summary[(self.routes_summary.length_street>0)].sort_values('generalized_benefit',ascending = False).iloc[[rank]].index.values[0]
+                    if self.projects is not None:
+                        project_idx = self.projects_summary.sort_values('generalized_benefit',ascending = False).iloc[[rank]].index.values[0]
+                    else:
+                        route_id_to_add = self.routes_summary[(self.routes_summary.length_street>0)].sort_values('generalized_benefit',ascending = False).iloc[[rank]].index.values[0]
                 
                 elif metric == 'fill':
                     route_id_to_add = self.routes_summary[(self.routes_summary.length_street>0)&(self.routes_summary.prop_cycleway<0.1)].sort_values('generalized_benefit',ascending = False).iloc[[rank]].index.values[0]
                     print('Adding route ', route_id_to_add, f'(benefit = {self.routes_summary.loc[route_id_to_add,"generalized_benefit"]},length = {self.routes_summary.loc[route_id_to_add,"length_street"]})')
-                   
-        
-                potential_edges = split_components(self.all_routes_edges[(self.all_routes_edges.route_number == int(route_id_to_add))&
-                                                   (self.all_routes_edges.highway!='cycleway')],self.cycleway_nodes)
+    
+                if self.projects is not None:
+                    edges_id_to_add = self.projects[self.projects['project'] == project_idx].index
+                    potential_edges = split_components(self.n_pot_edges.loc[edges_id_to_add][
+                                                   (self.n_pot_edges.loc[edges_id_to_add].highway!='cycleway')],self.cycleway_nodes)
+                else:
+                    potential_edges = split_components(self.all_routes_edges[(self.all_routes_edges.route_number == int(route_id_to_add))&
+                                                       (self.all_routes_edges.highway!='cycleway')],self.cycleway_nodes)
                 route_edges_to_add = potential_edges[(potential_edges.component_length>build_dmin)|(potential_edges.both_connected)]
                 rank+=1
     
-            
-            edges_id_to_add = route_edges_to_add.index
+            if self.projects is not None:
+                edges_id_to_add = self.projects[self.projects['project'] == project_idx].index
+                self.iterations_description.loc[i,'generalized_benefit'] = self.projects_summary.loc[project_idx,"generalized_benefit"]
+                self.iterations_description.loc[i,'n_near_completed_routes'] = self.projects_summary.loc[project_idx,"n_near_completed_routes"]
+            else:
+                edges_id_to_add = route_edges_to_add.index
+                self.iterations_description.loc[i,'generalized_benefit'] = self.routes_summary.loc[route_id_to_add,"generalized_benefit"]
+                self.iterations_description.loc[i,'n_near_completed_routes'] = self.routes_summary.loc[route_id_to_add,"n_near_completed_routes"]
             self.n_pot_edges.loc[edges_id_to_add,'highway']='cycleway'
             self.n_pot_edges.loc[edges_id_to_add,'build_iter'] = np.max(self.n_pot_edges.build_iter)+1
             self.n_ex_edges = self.n_pot_edges[self.n_pot_edges.highway == 'cycleway']
-            self.all_routes_edges.loc[edges_id_to_add,'highway']='cycleway'
-    
-            self.iterations_description.loc[i,'generalized_benefit'] = self.routes_summary.loc[route_id_to_add,"generalized_benefit"]
+            
+            
             added_length = self.n_pot_edges.loc[edges_id_to_add]['length'].sum()
             self.iterations_description.loc[i,'added_length'] = added_length
-            self.iterations_description.loc[i,'n_near_completed_routes'] = self.routes_summary.loc[route_id_to_add,"n_near_completed_routes"]
+            
     
-            print('Adding route ', route_id_to_add, f'(benefit = {self.routes_summary.loc[route_id_to_add,"generalized_benefit"]},length = {added_length})')
+            if self.projects is not None:
+                print('Adding', project_idx, f'(benefit = {self.projects_summary.loc[project_idx,"generalized_benefit"]},length = {added_length})')
+            else:
+                print('Adding route ', route_id_to_add, f'(benefit = {self.routes_summary.loc[route_id_to_add,"generalized_benefit"]},length = {added_length})')
+    
             
             self.weight_network(cost_reduction_factor, grades = True)
             routes_int_idxs = self.associated_links.loc[edges_id_to_add].values
             routes_int_idxs = list(set(routes_int_idxs) & set(self.sample.index.values))
        
-            self.evol.append(self.routes_summary.copy())
             
-            if len(routes_int_idxs) == 0:
-                self.compute_routes_replace(self.n_pot,turn_penalties,[route_id_to_add])
+            
+            if self.projects is None:
+                self.all_routes_edges.loc[edges_id_to_add,'highway']='cycleway'
+                added_routes.append(route_id_to_add)
+                subsample_idxs = list(set(routes_int_idxs)|set([route_id_to_add]))
             else:
-                print('recomputing ',len(routes_int_idxs)/len(self.sample),f'({len(routes_int_idxs)}/{len(self.sample)})')
-                self.compute_routes_replace(self.n_pot,turn_penalties,list(set(routes_int_idxs)-set(added_routes)))
-            self.iterations_description.loc[i,'n_recomputed_routes'] = len(routes_int_idxs)
-            print('Computing route metrics...')
-            added_routes.append(route_id_to_add)
+                used_edges_added = self.all_routes_edges.index.intersection(edges_id_to_add)
+                self.all_routes_edges.loc[used_edges_added,'highway']='cycleway'
+                subsample_idxs = list(set(routes_int_idxs))
+            if recompute_routes:   
+                if len(routes_int_idxs) == 0:
+                    self.compute_routes_replace(self.n_pot,turn_penalties,[route_id_to_add])
+                else:
+                    print('recomputing ',len(routes_int_idxs)/len(self.sample),f'({len(routes_int_idxs)}/{len(self.sample)})')
+                    self.compute_routes_replace(self.n_pot,turn_penalties,list(set(routes_int_idxs)-set(added_routes)))
+                self.iterations_description.loc[i,'n_recomputed_routes'] = len(routes_int_idxs)
+                
+            print('Computing route metrics...')    
             self.compute_routes_summary(beta_age = beta_age,
                                         mu_age = mu_age,
                                         scale_age = scale_age,
@@ -534,7 +653,8 @@ class Network:
                                         proximity_dist = proximity_dist,
                                         alpha = alpha,
                                         weight = weight,
-                                        subsample_idxs = list(set(routes_int_idxs)|set([route_id_to_add])))
+                                        subsample_idxs = subsample_idxs)
+            self.evol.append(self.routes_summary.copy())
         
         self.save_network(savepath = savepath,i='final')
         self.routes_summary.to_csv(savepath + f"/summary_{i}.csv", index=False)
@@ -608,7 +728,7 @@ class Network:
         self.n_pot_og = ox.graph_from_gdfs(self.n_pot_nodes.copy(),self.n_pot_edges.copy())
         self.n_ex_og = ox.graph_from_gdfs(self.n_ex_nodes.copy(),self.n_ex_edges.copy())
     
-    def display_network(self, tiles = 'OpenStreetMap',savepath = None, max_iter = None,color = 'red',show = True):
+    def display_network(self, tiles = 'CartoDB Positron',savepath = None, max_iter = None,color = 'red',show = True):
         built_edges = self.n_ex_edges[self.n_ex_edges.build_iter > 0]
         existing_edges = self.n_ex_edges[self.n_ex_edges.build_iter == 0]
         if max_iter is not None:
@@ -688,4 +808,21 @@ class Network:
     
     def get_turn_penalties(self,network,icp,ltp,rtp,tsp):
         self.turn_penalties = penalty_turns(network,left_turn_penalty=ltp,right_turn_penalty=rtp,intersection_crossing_penalty=icp,traffic_signals_penalty=tsp)
+
+    def cross_gdf_buildable(self,gdf):
+        gdf['buffer'] = gdf.buffer(5)
+        self.n_pot_edges['buffer'] = self.n_pot_edges.buffer(5)
+        gdf['buffer_gdf'] = gdf.buffer(5)
+        self.n_pot_edges['buffer_osm'] = self.n_pot_edges.buffer(5)
+        
+        overlay = gpd.overlay(gdf.set_geometry('buffer').to_crs(self.crs),self.n_pot_edges.reset_index().set_geometry('buffer'),how = 'intersection')
+        overlay['overlay_ratio'] = overlay.geometry.area/overlay.buffer_osm.area
+        overlay = overlay[overlay.overlay_ratio>0.5]
+        edges_overlay = self.n_pot_edges.loc[overlay.loc[overlay.groupby(['u','v','key'])['overlay_ratio'].idxmax()].set_index(['u','v','key']).index]
+        self.n_pot_edges.loc[edges_overlay.index,'buildable']=True
+        self.n_pot_edges.loc[:,'buildable'] = self.n_pot_edges.loc[:,'buildable'].fillna(False)
+        self.n_pot = ox.graph_from_gdfs(self.n_pot_nodes,self.n_pot_edges)
+        self.projects = group_street_components(self.n_pot_edges[self.n_pot_edges.buildable == True],name_col = 'name')
+        self.n_pot_og = ox.graph_from_gdfs(self.n_pot_nodes.copy(),self.n_pot_edges.copy())
+        self.n_ex_og = ox.graph_from_gdfs(self.n_ex_nodes.copy(),self.n_ex_edges.copy())
     
